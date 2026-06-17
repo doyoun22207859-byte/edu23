@@ -1,0 +1,718 @@
+
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>가려진 길 (The Way Home) - 최종 완성 패키지</title>
+    <!-- Tailwind CSS 탑재 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;700;900&display=swap');
+        body {
+            font-family: 'Noto Sans KR', sans-serif;
+            background-color: #030706;
+            margin: 0; padding: 0;
+        }
+        /* 캔버스 테두리 글로우 효과 */
+    .canvas-glow {
+        box-shadow: 0 0 35px rgba(16, 185, 129, 0.15);
+    }
+</style>
+</head>
+<body class="overflow-hidden h-screen flex flex-col justify-center items-center bg-[#020504] text-gray-100 selection:bg-emerald-500 selection:text-black">
+
+    <!-- 캔버스 컨테이너 -->
+    <div class="relative canvas-glow rounded-2xl overflow-hidden border border-emerald-950/50">
+        <canvas id="gameCanvas" width="900" height="600" class="block" oncontextmenu="return false;"></canvas>
+        
+        <!-- 게임 시작 오버레이 대기 화면: 오직 제목과 시작 버튼만 노출 -->
+        <div id="startOverlay" class="absolute inset-0 bg-[#040807]/95 flex flex-col justify-center items-center text-center p-8 transition-all duration-500 z-50">
+            <h2 class="text-5xl font-black text-emerald-100 tracking-widest uppercase neon-title mb-8">가려진 길</h2>
+            <button id="startButton" class="px-10 py-4 bg-emerald-500 text-black font-extrabold rounded-xl hover:bg-emerald-400 active:scale-95 transition-all text-base tracking-widest shadow-lg shadow-emerald-500/20">
+                여정 시작하기 (SOUND ON)
+            </button>
+        </div>
+
+        <!-- 게임 클리어 / 엔딩 크레딧 레이어 -->
+        <div id="endingOverlay" class="absolute inset-0 bg-white text-gray-900 flex flex-col justify-center items-center text-center p-8 opacity-0 pointer-events-none transition-all duration-1000 z-50">
+            <span class="text-3xl">🏠</span>
+            <h2 class="text-4xl font-extrabold mt-4 text-emerald-900 tracking-tight">다녀왔습니다</h2>
+            <p class="text-sm text-gray-600 mt-2 max-w-md leading-relaxed">
+                세상의 모든 낯설고 두려운 경고음을 건너,<br>
+                마침내 엄마와 할머니가 기다리는 포근한 집에 무사히 도착했습니다.
+            </p>
+            <p class="text-xs text-gray-400 mt-8 leading-relaxed">
+                "보이지 않는다고 해서 길이 없는 것은 아닙니다.<br>
+                길은 언제나 당신의 발끝과 귀끝, 그리고 용기 속에 닿아 있습니다."
+            </p>
+            <button onclick="location.reload()" class="mt-8 px-6 py-2.5 border border-emerald-600 text-emerald-700 font-bold rounded-lg hover:bg-emerald-50 active:scale-95 transition-all text-xs">
+                여정 다시 시작하기
+            </button>
+        </div>
+    </div>
+
+    <!-- Web Audio 신디사이저 & 게임 제어 스크립트 -->
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const startOverlay = document.getElementById('startOverlay');
+        const startButton = document.getElementById('startButton');
+        const endingOverlay = document.getElementById('endingOverlay');
+
+        // Web Audio API 오디오 컨텍스트 정의 (지연 선언)
+        let audioCtx = null;
+
+        // 사운드 합성 함수
+        function playSynthSound(freq, type, duration, vol = 0.1) {
+            if (!audioCtx) return;
+            try {
+                const osc = audioCtx.createOscillator(); const gain = audioCtx.createGain();
+                osc.type = type; osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+                gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+                osc.connect(gain); gain.connect(audioCtx.destination);
+                osc.start(); osc.stop(audioCtx.currentTime + duration);
+            } catch (e) {}
+        }
+
+        let gameActive = false;
+        let isHolding = false; // 빨간불 정지용 홀드 상태 감지
+        let currentStage = 1; // Stage 1, 2, 3
+        let targetSpeed = 5.0; // 기본 자동 전진 속도
+        let finalCleared = false;
+
+        let holdEffectTimer = 0; // 정지 이펙트 애니메이션 타이머
+        let prevHoldState = false; // 이전 프레임의 정지 상태 기록
+
+        // 더 넓고 우아한 도약 궤적을 만드는 물리 엔진 튜닝
+        const player = {
+            x: 150,
+            y: 400,
+            vy: 0,
+            gravity: 0.8, 
+            jumpForce: -15.5, 
+            isJumping: false,
+            speed: 0,
+            radius: 16,
+            lives: 3,
+            maxLives: 3,
+            knockbackFrames: 0,
+            invulFrames: 0,
+            trail: []
+        };
+
+        const groundY = 400;
+        let cameraX = 0;
+
+        // 스테이지별 실패 지점 영구 흔적 (빨간 X 흔적)
+        const failureScars = { 1: [], 2: [], 3: [] };
+
+        // 맵 끝 위치 리스트
+        const STAGE_END_X = {
+            1: 6800,
+            2: 7200,
+            3: 6500
+        };
+
+        // 장애물 소나 음파(Wave) 데이터 구조
+        let sonarWaves = [];
+
+        // TTS 제어 변수 (각 신호등별로 고유 재생 관리)
+        let ttsSpokenObs = null;
+
+        // TTS 한국어 음성 재생 함수 (보안 샌드박스 안정성 보호망 추가)
+        function speakTTS(message) {
+            try {
+                if ('speechSynthesis' in window) {
+                    window.speechSynthesis.cancel();
+                    const utterance = new SpeechSynthesisUtterance(message);
+                    utterance.lang = 'ko-KR';
+                    utterance.rate = 1.1; 
+                    utterance.volume = 0.95;
+                    window.speechSynthesis.speak(utterance);
+                }
+            } catch (e) {
+                console.warn("speechSynthesis is blocked or failed in this sandbox:", e);
+            }
+        }
+
+        // 장애물 프리셋 설계 (Stage 2 장애물 고정, Stage 3 메아리 & 괘종시계 & 풍경 기믹 추가)
+        const obstacles = {
+            1: [ // Stage 1 숲길: 멍멍이, 개구리, 바람버섯, 가시덤불
+                { id: 101, x: 800, type: 'dog', w: 85, h: 50, color: '#f59e0b' },
+                { id: 102, x: 1500, type: 'frog', w: 50, h: 45, color: '#10b981', jumpState: 0 },
+                { id: 103, x: 2200, type: 'bush', w: 60, h: 60, color: '#047857' },
+                { id: 104, x: 2800, type: 'mushroom', w: 45, h: 65, color: '#ec4899' },
+                { id: 105, x: 3500, type: 'dog', w: 85, h: 50, color: '#f59e0b' },
+                { id: 106, x: 4200, type: 'frog', w: 50, h: 45, color: '#10b981', jumpState: 0 },
+                { id: 107, x: 4900, type: 'bush', w: 60, h: 60, color: '#047857' },
+                { id: 108, x: 5600, type: 'mushroom', w: 45, h: 65, color: '#ec4899' },
+                { id: 109, x: 6200, type: 'frog', w: 50, h: 45, color: '#10b981', jumpState: 0 }
+            ],
+            2: [ // Stage 2 도심: 소리신호기, 환풍기, 세워진 자전거 (기존 배치 100% 동일 보존)
+                { id: 201, x: 900, type: 'trafficLight', w: 60, h: 220, color: '#3b82f6', lightState: 'green', timer: 600, ttsRed: false, ttsGreen: false, active: false }, // 10초 주기 리셋
+                { id: 202, x: 1700, type: 'vent', w: 90, h: 15, color: '#64748b' },
+                { id: 203, x: 2500, type: 'bicycle', w: 80, h: 70, color: '#cbd5e1' },
+                { id: 204, x: 3300, type: 'trafficLight', w: 60, h: 220, color: '#3b82f6', lightState: 'green', timer: 600, ttsRed: false, ttsGreen: false, active: false },
+                { id: 205, x: 4100, type: 'vent', w: 90, h: 15, color: '#64748b' },
+                { id: 206, x: 4900, type: 'bicycle', w: 80, h: 70, color: '#cbd5e1' },
+                { id: 207, x: 5700, type: 'trafficLight', w: 60, h: 220, color: '#3b82f6', lightState: 'green', timer: 600, ttsRed: false, ttsGreen: false, active: false },
+                { id: 208, x: 6500, type: 'bicycle', w: 80, h: 70, color: '#cbd5e1' }
+            ],
+            3: [ // Stage 3 마지막 한걸음: 괘종시계 똑딱, 맑은 풍경(WindChime), 왜곡 가시덤불, 미지의 투명 유리벽
+                { id: 301, x: 600, type: 'windChime', w: 40, h: 120, ringTimer: 0 }, // 맑은 풍경 소리 기믹 (어둠 걷기)
+                { id: 302, x: 1100, type: 'clock', w: 55, h: 95 }, // 똑딱 리드미컬 괘종시계 
+                { id: 303, x: 1800, type: 'fearWall', w: 70, h: 80, color: '#f43f5e' }, // 무해한 가시장막
+                { id: 304, x: 2300, type: 'windChime', w: 40, h: 120, ringTimer: 0 }, // 맑은 풍경
+                { id: 305, x: 2900, type: 'window', w: 20, h: 140, color: '#38bdf8' }, // 투명 유리벽
+                { id: 306, x: 3600, type: 'clock', w: 55, h: 95 },
+                { id: 307, x: 4200, type: 'windChime', w: 40, h: 120, ringTimer: 0 },
+                { id: 308, x: 4800, type: 'rockingChair', w: 65, h: 75, color: '#d97706' },
+                { id: 309, x: 5500, type: 'window', w: 20, h: 140, color: '#38bdf8' }
+            ]
+        };
+
+        // 우측 배경 디자인 요소 정의
+        const bgAssets = {
+            stars: Array.from({ length: 45 }, () => ({ x: Math.random() * 900, y: Math.random() * 250, r: Math.random() * 1.5 + 0.5, alpha: Math.random() })),
+            spiroTrees: Array.from({ length: 12 }, (_, i) => ({ x: i * 700 + 100, size: 70 + Math.random() * 50, leafCount: 5 + Math.floor(Math.random() * 4) })),
+            cityBuildings: Array.from({ length: 15 }, (_, i) => ({ x: i * 500, w: 120 + Math.random() * 100, h: 250 + Math.random() * 180 })),
+            homeInterior: Array.from({ length: 10 }, (_, i) => ({ x: i * 700, type: ['lamp', 'frame', 'curtain'][i % 3] }))
+        };
+
+        // 오디오 시작 및 게임 초기 구동 리스너 (보안 예외 철저 가드 처리)
+        startButton.addEventListener('click', () => {
+            try {
+                if (!audioCtx) {
+                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                }
+            } catch (e) {
+                console.error("AudioContext could not be initialized due to platform sandbox restrictions:", e);
+            }
+            startOverlay.style.opacity = '0';
+            setTimeout(() => {
+                startOverlay.style.display = 'none';
+                gameActive = true;
+                player.speed = targetSpeed;
+            }, 500);
+        });
+
+        // 9시 35분 원본 특유의 점프 조작 및 Shift 완전 정지 지원
+        window.addEventListener('keydown', (e) => {
+            if (!gameActive || finalCleared) return;
+            if (e.code === 'Space') {
+                e.preventDefault();
+                if (player.knockbackFrames === 0) isHolding = true; 
+            }
+            if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+                if (player.knockbackFrames === 0) isHolding = true; 
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.code === 'Space') {
+                isHolding = false;
+                if (player.knockbackFrames === 0 && !player.isJumping && player.y >= groundY) {
+                    player.vy = player.jumpForce; 
+                    player.isJumping = true;
+                    playSynthSound(300, 'square', 0.25, 0.15); 
+                }
+            }
+            if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+                isHolding = false; 
+            }
+        });
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (!gameActive || finalCleared) return;
+            if (e.button === 0) { if (player.knockbackFrames === 0) isHolding = true; } 
+            if (e.button === 2) { if (player.knockbackFrames === 0) isHolding = true; } 
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (e.button === 0) {
+                isHolding = false;
+                if (player.knockbackFrames === 0 && !player.isJumping && player.y >= groundY) {
+                    player.vy = player.jumpForce;
+                    player.isJumping = true;
+                    playSynthSound(300, 'square', 0.25, 0.15);
+                }
+            }
+            if (e.button === 2) {
+                isHolding = false; 
+            }
+        });
+
+        // 충돌 및 하트 소모 시 리셋 처리 함수
+        function triggerCollision(obstacleX) {
+            player.lives--;
+            player.invulFrames = 60; 
+            player.knockbackFrames = 25; 
+            isHolding = false;
+
+            // 충돌 타격음 발생
+            playSynthSound(100, 'sawtooth', 0.5, 0.3);
+
+            // 실패 위치에 영구 상흔 누적 기록
+            failureScars[currentStage].push({ x: player.x, y: player.y });
+
+            if (player.lives <= 0) {
+                player.lives = player.maxLives;
+                player.x = 150;
+                player.y = groundY;
+                player.vy = 0;
+                player.isJumping = false;
+                cameraX = 0;
+                
+                Object.values(obstacles).forEach(stageObs => stageObs.forEach(o => { o.ttsRed = false; o.ttsGreen = false; o.active = false; }));
+                playSynthSound(80, 'sine', 0.9, 0.4);
+            } else {
+                player.vy = -7; 
+            }
+        }
+
+        // 60FPS 프레임별 물리 엔진 계산
+        function update() {
+            if (!gameActive || finalCleared) return;
+
+            // 완전 정지 전환 시 마찰음 출력 및 이펙트 틱 증가
+            if (isHolding && !prevHoldState && player.knockbackFrames === 0 && player.y >= groundY) {
+                playSynthSound(150, 'sawtooth', 0.15, 0.05); 
+                holdEffectTimer = 0;
+            }
+            prevHoldState = isHolding;
+            if (isHolding) holdEffectTimer++;
+
+            if (player.invulFrames > 0) player.invulFrames--;
+
+            if (player.knockbackFrames > 0) {
+                player.knockbackFrames--; 
+                player.speed = -4.5; 
+                
+                player.vy += player.gravity; player.y += player.vy;
+                if (player.y >= groundY) { player.y = groundY; player.vy = 0; player.isJumping = false; }
+                
+                player.x += player.speed;
+                player.x = Math.max(150, player.x); 
+                cameraX = player.x - 200; 
+                sonarWaves = []; 
+            } else {
+                player.speed = isHolding ? 0 : targetSpeed;
+
+                player.vy += player.gravity; player.y += player.vy;
+                if (player.y >= groundY) {
+                    player.y = groundY;
+                    if (player.vy > 0) { player.vy = 0; if (player.isJumping) { player.isJumping = false; playSynthSound(130, 'triangle', 0.1, 0.1); } }
+                }
+                player.x += player.speed; cameraX = player.x - 200;
+            }
+
+            if (player.speed > 0 && Math.abs(player.vy) > 0.1) {
+                player.trail.push({ x: player.x, y: player.y, r: 8 });
+                if (player.trail.length > 25) player.trail.shift();
+            } else { if (player.trail.length > 0) player.trail.shift(); }
+
+            const obsList = obstacles[currentStage];
+            
+            // 실시간 소나 음파 발생 시스템 (Chime 기믹 제외하고 발신)
+            if (Math.random() < 0.02) {
+                obsList.forEach(obs => {
+                    if (obs.x > cameraX && obs.x < cameraX + 1100 && obs.type !== 'trafficLight' && obs.type !== 'windChime') {
+                        sonarWaves.push({ obsId: obs.id, x: obs.x + (obs.w ? obs.w/2 : 25), y: 380, radius: 1, maxRadius: 380, opacity: 1 });
+                    }
+                });
+            }
+
+            sonarWaves.forEach(w => { w.radius += 3.5; w.opacity = 1 - (w.radius / w.maxRadius); });
+            sonarWaves = sonarWaves.filter(w => w.radius < w.maxRadius);
+
+            // 장애물 상호작용 업데이트 루프
+            obsList.forEach(obs => {
+                // 1. Stage 1 개구리 도약 애니메이션
+                if (obs.type === 'frog') {
+                    if (!obs.jumpState) obs.jumpState = 0;
+                    obs.timer = (obs.timer || 0) + 1;
+                    if (obs.timer > 120) { 
+                        obs.yOffset = Math.sin((obs.timer - 120) * 0.08) * 110;
+                        if (obs.yOffset >= 0) { obs.yOffset = 0; obs.timer = 0; }
+                    } else { obs.yOffset = 0; }
+                }
+
+                // 2. Stage 2 신호등 타이머 및 사전 신호음 동적 트리거 개선 적용
+                if (obs.type === 'trafficLight') {
+                    const distToSignal = obs.x - player.x;
+
+                    // 만약 플레이어가 넉백으로 멀어지거나 완벽히 지나치면 상태 초기화
+                    if (distToSignal > 500 || distToSignal < -100) {
+                        obs.active = false;
+                        obs.ttsRed = false;
+                        obs.ttsGreen = false;
+                    }
+
+                    // 접근 감지: 플레이어가 450px 안쪽으로 들어오면 정확히 '빨간불 6.6초 대기' 루프를 즉각 기동
+                    if (distToSignal <= 450 && distToSignal >= -50 && !obs.active) {
+                        obs.active = true;
+                        obs.lightState = 'red'; // 무조건 빨간불로 정직하게 시작하여 유격 없는 홀드 학습 유도
+                        obs.timer = 400; // 6.6초
+                        obs.ttsRed = false;
+                        obs.ttsGreen = false;
+                    }
+
+                    if (obs.active) {
+                        obs.timer--;
+                        
+                        // 신호 변경 1.5초(90프레임) 전 사전 예고 신호음 '띠띠띠' 동기화
+                        if (obs.timer > 0 && obs.timer <= 90) {
+                            if (obs.timer % 30 === 0) { 
+                                playSynthSound(800, 'square', 0.1, 0.05); 
+                            }
+                        }
+
+                        if (obs.timer <= 0) {
+                            obs.lightState = obs.lightState === 'green' ? 'red' : 'green';
+                            obs.timer = 600; // 10초 주기 유지
+                            obs.ttsRed = false; 
+                            obs.ttsGreen = false;
+                        }
+
+                        // 음성 안내 송출 트리거 (거리 조건 충족 시)
+                        if (distToSignal > -50 && distToSignal < 450) {
+                            if (obs.lightState === 'red' && !obs.ttsRed) {
+                                speakTTS("빨간불입니다. 잠시만 기다려 주십시오.");
+                                obs.ttsRed = true; obs.ttsGreen = false;
+                            } else if (obs.lightState === 'green' && !obs.ttsGreen) {
+                                speakTTS("녹색불이 켜졌습니다. 건너가도 좋습니다.");
+                                obs.ttsGreen = true; obs.ttsRed = false;
+                            }
+                        }
+                    }
+                }
+
+                // 3. Stage 3 전용 기믹 업데이트 (풍경 & 괘종시계)
+                if (obs.type === 'windChime') {
+                    // 아이가 다가왔을 때 맑은 메아리 파동 방출
+                    const distToChime = Math.abs(obs.x - player.x);
+                    if (distToChime < 350) {
+                        obs.ringTimer = (obs.ringTimer || 0) + 1;
+                        if (obs.ringTimer % 80 === 1) {
+                            // 하프 처럼 부드럽고 맑은 고주파 합성음 연속 재생 (풍경 소리)
+                            playSynthSound(1046.50, 'sine', 0.35, 0.08); // Do
+                            setTimeout(() => playSynthSound(1318.51, 'sine', 0.25, 0.06), 80); // Mi
+                            setTimeout(() => playSynthSound(1567.98, 'sine', 0.35, 0.05), 160); // Sol
+                        }
+                    } else {
+                        obs.ringTimer = 0;
+                    }
+                }
+
+                if (obs.type === 'clock') {
+                    // 똑딱 똑딱 소리의 기계적 규칙성
+                    obs.tickTimer = (obs.tickTimer || 0) + 1;
+                    if (obs.tickTimer % 45 === 0) {
+                        playSynthSound(220, 'triangle', 0.05, 0.1); // 똑!
+                    } else if (obs.tickTimer % 45 === 22) {
+                        playSynthSound(180, 'triangle', 0.05, 0.08); // 딱!
+                    }
+                }
+
+                // 너그러운 판정 적용으로 억울한 충돌 방지
+                if (player.invulFrames === 0 && player.knockbackFrames === 0) {
+                    if (obs.type === 'fearWall' || obs.type === 'windChime') return; // 환영 및 도움 기믹 무시
+
+                    let hitX = obs.x + (obs.w || 50) * 0.15; 
+                    let hitW = (obs.w || 50) * 0.7;        
+                    let hitH = (obs.h || 50) * 0.75;       
+                    let hitY = groundY - hitH;
+
+                    if (obs.type === 'frog' && obs.yOffset) { 
+                        hitY += obs.yOffset; 
+                    }
+
+                    if (obs.type === 'trafficLight') { 
+                        hitX = obs.x + 20; 
+                        hitW = 20; 
+                        hitH = obs.h || 220;
+                        hitY = groundY - hitH;
+                    }
+
+                    const px = player.x; const py = player.y;
+                    const colRadius = 11;
+
+                    if (px + colRadius > hitX && px - colRadius < hitX + hitW &&
+                        py + colRadius > hitY && py - colRadius < hitY + hitH) {
+
+                        if (obs.type === 'vent') {
+                            player.vy = -20; player.isJumping = true; playSynthSound(550, 'sine', 0.4, 0.2);
+                        } else if (obs.type === 'mushroom') {
+                            if (player.vy > 0 && py < (groundY - hitH) + 15) {
+                                player.vy = -17; player.isJumping = true; playSynthSound(450, 'triangle', 0.35, 0.15);
+                            } else { triggerCollision(obs.x); }
+                        } else if (obs.type === 'trafficLight') {
+                            // 활성화 상태이면서 빨간불일 때만 부딪힘
+                            if (obs.active && obs.lightState === 'red') { triggerCollision(obs.x); }
+                        } else {
+                            triggerCollision(obs.x);
+                        }
+                    }
+                }
+            });
+
+            // 다음 레벨 및 클리어 판정
+            if (player.x >= STAGE_END_X[currentStage]) {
+                if (currentStage < 3) {
+                    currentStage++; player.x = 150; player.y = groundY; player.vy = 0; cameraX = 0;
+                    Object.values(obstacles).forEach(stageObs => stageObs.forEach(o => { o.ttsRed = false; o.ttsGreen = false; o.active = false; }));
+                    playSynthSound(600, 'sine', 0.6, 0.2);
+                } else {
+                    finalCleared = true;
+                    endingOverlay.style.opacity = '1';
+                    endingOverlay.style.pointerEvents = 'auto';
+                }
+            }
+        }
+
+        // 9시 35분 원본 렌더링 유지 + Stage 3 풍경 소리의 지각적 어둠 걷기 비주얼 반영
+        function draw() {
+            ctx.clearRect(0, 0, 900, 600);
+
+            // [레이어 1] 그라데이션 베이스 하늘
+            let bgGrad = ctx.createLinearGradient(0, 0, 0, 600);
+            if (currentStage === 1) { bgGrad.addColorStop(0, '#020d08'); bgGrad.addColorStop(1, '#05110c'); }
+            else if (currentStage === 2) { bgGrad.addColorStop(0, '#030814'); bgGrad.addColorStop(1, '#050a17'); }
+            else { bgGrad.addColorStop(0, '#0c0702'); bgGrad.addColorStop(1, '#170c04'); }
+            ctx.fillStyle = bgGrad; ctx.fillRect(0, 0, 900, 600);
+
+            ctx.save(); ctx.translate(-cameraX, 0);
+
+            // [레이어 2] 아름다운 배경 일러스트 (Spiro-Trees, Neon Buildings 등) - 가시성 대폭 상향 수정
+            if (currentStage === 1) {
+                bgAssets.stars.forEach(s => {
+                    ctx.fillStyle = `rgba(255, 255, 255, ${s.alpha * 0.55})`; // 하얀 별무리로 변경
+                    ctx.beginPath(); ctx.arc(s.x + cameraX * 0.25, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+                });
+                bgAssets.spiroTrees.forEach(t => {
+                    if (t.x < cameraX - 200 || t.x > cameraX + 1100) return;
+                    ctx.strokeStyle = 'rgba(16, 185, 129, 0.45)'; ctx.lineWidth = 1; // 잎 투명도 대폭 상향
+                    for (let j = 0; j < t.leafCount; j++) {
+                        ctx.beginPath(); ctx.ellipse(t.x, 260, t.size * 0.5, t.size, (j * Math.PI) / t.leafCount, 0, Math.PI * 2); ctx.stroke();
+                    }
+                    ctx.strokeStyle = 'rgba(16, 185, 129, 0.65)'; ctx.beginPath(); ctx.moveTo(t.x, 260); ctx.lineTo(t.x, 415); ctx.stroke(); // 나무기둥 상향
+                });
+            } else if (currentStage === 2) {
+                bgAssets.cityBuildings.forEach((b, idx) => {
+                    if (b.x < cameraX - 300 || b.x > cameraX + 1100) return;
+                    ctx.fillStyle = 'rgba(59, 130, 246, 0.15)'; ctx.strokeStyle = 'rgba(59, 130, 246, 0.35)'; ctx.lineWidth = 1; // 빌딩 윤곽 상향
+                    ctx.fillRect(b.x + cameraX*0.1, 415 - b.h, b.w, b.h); ctx.strokeRect(b.x + cameraX*0.1, 415 - b.h, b.w, b.h);
+                    ctx.fillStyle = 'rgba(253, 224, 71, 0.65)'; // 아름다운 네온 불빛 창문들 투명도 상향
+                    for (let wx = 15; wx < b.w - 15; wx += 25) {
+                        for (let wy = 20; wy < b.h - 20; wy += 35) { if ((wx + wy + idx) % 5 === 0) ctx.fillRect(b.x + cameraX*0.1 + wx, 415 - b.h + wy, 8, 12); }
+                    }
+                });
+            } else {
+                bgAssets.homeInterior.forEach((asset, idx) => {
+                    const ax = idx * 600 + 200; if (ax < cameraX - 200 || ax > cameraX + 1100) return;
+                    ctx.strokeStyle = 'rgba(217, 119, 6, 0.55)'; ctx.lineWidth = 1.5; // 실내 가구 투명도 상향
+                    if (asset.type === 'lamp') {
+                        ctx.beginPath(); ctx.moveTo(ax, 415); ctx.lineTo(ax, 280);
+                        ctx.moveTo(ax - 20, 280); ctx.lineTo(ax + 20, 280);
+                        ctx.lineTo(ax + 10, 250); ctx.lineTo(ax - 10, 250); ctx.closePath();
+                        ctx.stroke();
+                        let lampGrad = ctx.createRadialGradient(ax, 260, 5, ax, 320, 70); lampGrad.addColorStop(0, 'rgba(253, 224, 71, 0.35)'); lampGrad.addColorStop(1, 'rgba(253, 224, 71, 0)');
+                        ctx.fillStyle = lampGrad; ctx.beginPath(); ctx.arc(ax, 260, 70, 0, Math.PI, false); ctx.fill();
+                    } else if (asset.type === 'frame') {
+                        ctx.strokeRect(ax, 230, 80, 60); ctx.beginPath(); ctx.moveTo(ax + 10, 280); ctx.lineTo(ax + 40, 245); ctx.lineTo(ax + 70, 280); ctx.stroke();
+                    }
+                });
+            }
+
+            // [레이어 3] 실패의 기억 (X 상흔)
+            failureScars[currentStage].forEach(scar => {
+                ctx.strokeStyle = '#f43f5e'; ctx.lineWidth = 2.5;
+                ctx.beginPath(); ctx.moveTo(scar.x - 10, scar.y - 10); ctx.lineTo(scar.x + 10, scar.y + 10);
+                ctx.moveTo(scar.x + 10, scar.y - 10); ctx.lineTo(scar.x - 10, scar.y + 10); ctx.stroke();
+                ctx.fillStyle = 'rgba(244, 63, 94, 0.1)'; ctx.beginPath(); ctx.arc(scar.x, scar.y, 18, 0, Math.PI*2); ctx.fill();
+            });
+
+            // 지면 라인 묘사
+            ctx.strokeStyle = currentStage === 1 ? '#047857' : currentStage === 2 ? '#1e3a8a' : '#78350f'; ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.moveTo(cameraX, 415); ctx.lineTo(cameraX + 900, 415); ctx.stroke();
+            ctx.fillStyle = currentStage === 1 ? 'rgba(4, 120, 87, 0.04)' : currentStage === 2 ? 'rgba(30, 58, 138, 0.04)' : 'rgba(120, 53, 15, 0.04)'; ctx.fillRect(cameraX, 415, 900, 185);
+
+            // [레이어 4] 실체화된 장애물 디테일 선화 렌더링
+            const obsList = obstacles[currentStage];
+            obsList.forEach(obs => {
+                let obsY = groundY - (obs.h || 50);
+                if (obs.type === 'frog' && obs.yOffset) obsY += obs.yOffset;
+
+                ctx.save(); ctx.translate(obs.x, obsY);
+
+                if (obs.type === 'dog') {
+                    ctx.fillStyle = '#d97706'; ctx.beginPath(); ctx.ellipse(45, 33, 30, 18, 0, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(18, 25, 12, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#b45309'; ctx.beginPath(); ctx.ellipse(15, 29, 6, 12, 0.2, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#d97706'; ctx.beginPath(); ctx.arc(30, 45, 6, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(60, 45, 6, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#1e293b'; ctx.beginPath(); ctx.arc(12, 24, 1.5, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(9, 28, 2, 0, Math.PI*2); ctx.fill();  
+                } else if (obs.type === 'frog') {
+                    ctx.fillStyle = '#059669'; ctx.beginPath(); ctx.ellipse(25, 25, 22, 16, 0, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(25, 15, 11, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(19, 10, 4, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(31, 10, 4, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#000000'; ctx.beginPath(); ctx.arc(19, 10, 2, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(31, 10, 2, 0, Math.PI*2); ctx.fill();
+                } else if (obs.type === 'bush') {
+                    ctx.fillStyle = '#065f46'; ctx.beginPath(); ctx.arc(20, 35, 22, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(40, 30, 25, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(28, 18, 20, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#f43f5e'; ctx.beginPath(); ctx.arc(15, 25, 4.5, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(38, 20, 4, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(25, 38, 5, 0, Math.PI*2); ctx.fill();
+                } else if (obs.type === 'mushroom') {
+                    ctx.fillStyle = '#f472b6'; ctx.beginPath(); ctx.ellipse(22, 18, 22, 13, 0, 0, Math.PI*2); ctx.fill(); ctx.fillStyle = '#f1f5f9'; ctx.fillRect(16, 18, 12, 35);
+                } else if (obs.type === 'trafficLight') {
+                    ctx.fillStyle = '#334155'; ctx.fillRect(25, 0, 10, 220); ctx.fillStyle = '#1e293b'; ctx.fillRect(5, 10, 50, 95);  
+                    
+                    ctx.fillStyle = obs.lightState === 'red' ? '#ef4444' : '#1e293b'; ctx.beginPath(); ctx.arc(30, 35, 16, 0, Math.PI*2); ctx.fill(); 
+                    if (obs.lightState === 'red') { ctx.shadowColor = '#f87171'; ctx.shadowBlur = 18; ctx.fillStyle = '#fecaca'; ctx.beginPath(); ctx.arc(30, 35, 10, 0, Math.PI*2); ctx.fill(); ctx.shadowBlur = 0; }
+                    
+                    ctx.fillStyle = obs.lightState === 'green' ? '#10b981' : '#1e293b'; ctx.beginPath(); ctx.arc(30, 78, 16, 0, Math.PI*2); ctx.fill(); 
+                    if (obs.lightState === 'green') { ctx.shadowColor = '#34d399'; ctx.shadowBlur = 18; ctx.fillStyle = '#a7f3d0'; ctx.beginPath(); ctx.arc(30, 78, 10, 0, Math.PI*2); ctx.fill(); ctx.shadowBlur = 0; }
+                } else if (obs.type === 'vent') {
+                    ctx.fillStyle = '#475569'; ctx.fillRect(0, 0, obs.w, obs.h); ctx.fillStyle = '#0f172a'; for (let vx = 5; vx < obs.w; vx += 12) { ctx.fillRect(vx, 2, 4, 11); }
+                    ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(30, -5); ctx.lineTo(30, -50); ctx.moveTo(60, -5); ctx.lineTo(60, -45); ctx.stroke();
+                } else if (obs.type === 'bicycle') {
+                    ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(18, 48, 18, 0, Math.PI*2); ctx.stroke(); ctx.beginPath(); ctx.arc(62, 48, 18, 0, Math.PI*2); ctx.stroke(); ctx.beginPath(); ctx.moveTo(18, 48); ctx.lineTo(38, 48); ctx.lineTo(50, 20); ctx.lineTo(26, 20); ctx.closePath(); ctx.stroke();
+                } else if (obs.type === 'fearWall') {
+                    ctx.strokeStyle = 'rgba(244, 63, 94, 0.35)'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(0, 80); ctx.lineTo(35, 10); ctx.lineTo(70, 80); ctx.moveTo(15, 80); ctx.lineTo(35, 30); ctx.lineTo(55, 80); ctx.stroke();
+                } else if (obs.type === 'window') {
+                    ctx.fillStyle = 'rgba(56, 189, 248, 0.25)'; ctx.fillRect(0, 0, obs.w, obs.h); ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 1.5; ctx.strokeRect(0, 0, obs.w, obs.h);
+                } else if (obs.type === 'rockingChair') {
+                    ctx.strokeStyle = '#d97706'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(32, 20, 50, 0.4, Math.PI - 0.4, false); ctx.stroke(); ctx.beginPath(); ctx.moveTo(15, 35); ctx.lineTo(50, 35); ctx.moveTo(25, 35); ctx.lineTo(25, 65); ctx.moveTo(45, 35); ctx.lineTo(45, 65); ctx.moveTo(18, 35); ctx.lineTo(18, 5); ctx.stroke();
+                } else if (obs.type === 'windChime') {
+                    ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 2;
+                    ctx.beginPath(); ctx.moveTo(20, 0); ctx.lineTo(20, 40); ctx.stroke(); 
+                    ctx.fillStyle = '#fdbaf8'; ctx.beginPath(); ctx.ellipse(20, 40, 15, 8, 0, 0, Math.PI*2); ctx.fill(); 
+                    ctx.strokeStyle = '#f3e8ff'; ctx.lineWidth = 1.5;
+                    ctx.beginPath(); ctx.moveTo(20, 48); ctx.lineTo(20, 95); ctx.stroke(); 
+                    ctx.fillStyle = 'rgba(56, 189, 248, 0.25)';
+                    ctx.fillRect(14, 75, 12, 35); ctx.strokeRect(14, 75, 12, 35);
+                } else if (obs.type === 'clock') {
+                    ctx.fillStyle = '#78350f'; ctx.fillRect(0, 0, obs.w, obs.h);
+                    ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2.5; ctx.strokeRect(0, 0, obs.w, obs.h);
+                    ctx.fillStyle = '#fef08a'; ctx.beginPath(); ctx.arc(27, 28, 16, 0, Math.PI*2); ctx.fill(); 
+                    ctx.fillStyle = '#fbbf24'; ctx.beginPath(); ctx.arc(27, 28, 2, 0, Math.PI*2); ctx.fill(); 
+                    
+                    const angle = Math.sin((obs.tickTimer || 0) * 0.08) * 0.35;
+                    ctx.save(); ctx.translate(27, 45); ctx.rotate(angle);
+                    ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2.5;
+                    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, 35); ctx.stroke();
+                    ctx.fillStyle = '#fbbf24'; ctx.beginPath(); ctx.arc(0, 35, 7, 0, Math.PI*2); ctx.fill();
+                    ctx.restore();
+                }
+
+                ctx.restore();
+            });
+
+            ctx.restore(); // 월드 좌표 변환 완전 해제
+
+            // [레이어 5] 칠흑 같은 '어둠의 장막' (월드 마스크 적용 - 장애물 위를 오롯이 덮어 가림)
+            ctx.save();
+            let darkGrad = ctx.createRadialGradient(
+                player.x - cameraX, player.y, player.radius + 30,
+                player.x - cameraX, player.y, player.radius + 170
+            );
+            darkGrad.addColorStop(0, 'rgba(4, 8, 7, 0.45)');
+            darkGrad.addColorStop(1, '#040807');
+            ctx.fillStyle = darkGrad; ctx.fillRect(0, 0, 900, 600);
+
+            // Stage 3 전용 메아리 기믹: 풍경 소리가 퍼질 때, 그 처마 주변 지형을 부드럽게 걷어내기
+            if (currentStage === 3) {
+                obstacles[3].forEach(obs => {
+                    if (obs.type === 'windChime' && obs.ringTimer > 0) {
+                        const chimeWaveSize = (obs.ringTimer % 80) * 4.5;
+                        const screenObsX = obs.x - cameraX;
+                        
+                        let revealGrad = ctx.createRadialGradient(
+                            screenObsX + 20, groundY - 60, 5,
+                            screenObsX + 20, groundY - 60, Math.min(320, chimeWaveSize + 80)
+                        );
+                        revealGrad.addColorStop(0, 'rgba(253, 224, 71, 0.28)'); 
+                        revealGrad.addColorStop(0.7, 'rgba(253, 224, 71, 0.1)');
+                        revealGrad.addColorStop(1, 'rgba(4, 8, 7, 0)');
+                        
+                        ctx.fillStyle = revealGrad;
+                        ctx.beginPath();
+                        ctx.arc(screenObsX + 20, groundY - 60, Math.min(320, chimeWaveSize + 80), 0, Math.PI*2);
+                        ctx.fill();
+                    }
+                });
+            }
+            ctx.restore();
+
+            // [레이어 6] 어둠의 마스크 상단에 언제나 선명히 그릴 캐릭터 및 붉은 음파
+            ctx.save(); ctx.translate(-cameraX, 0);
+            
+            // 플레이어 그리기 (감은 눈의 평온한 황금빛 아이)
+            ctx.save(); ctx.translate(player.x, player.y);
+            player.trail.forEach((p, idx) => { ctx.fillStyle = `rgba(253, 224, 71, ${idx * 0.035})`; ctx.beginPath(); ctx.arc(p.x - player.x, p.y - player.y, player.radius * (idx / 25), 0, Math.PI*2); ctx.fill(); });
+            
+            if (isHolding && player.y >= groundY) {
+                ctx.strokeStyle = `rgba(56, 189, 248, ${0.5 + Math.sin(holdEffectTimer * 0.2) * 0.3})`;
+                ctx.lineWidth = 3; ctx.setLineDash([5, 5]);
+                ctx.beginPath(); ctx.arc(0, 0, player.radius + 12, 0, Math.PI*2); ctx.stroke();
+                ctx.setLineDash([]); 
+                
+                ctx.fillStyle = 'rgba(56, 189, 248, 0.25)';
+                ctx.beginPath(); ctx.ellipse(0, player.radius, 20, 5, 0, 0, Math.PI*2); ctx.fill();
+            }
+
+            if (player.invulFrames === 0 || player.invulFrames % 4 < 2) {
+                let plGrad = ctx.createRadialGradient(0, -2, 2, 0, 0, player.radius); plGrad.addColorStop(0, '#fef08a'); plGrad.addColorStop(1, '#facc15'); ctx.fillStyle = plGrad; ctx.beginPath(); ctx.arc(0, 0, player.radius, 0, Math.PI*2); ctx.fill();
+                ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath(); ctx.arc(-5, -2, 2.5, 0.2, Math.PI - 0.2, false); ctx.arc(5, -2, 2.5, 0.2, Math.PI - 0.2, false); ctx.stroke();
+            }
+            ctx.restore();
+
+            // 음파 및 바닥 예비/임계 경고선
+            obsList.forEach(obs => {
+                const relativeDist = obs.x - player.x;
+                const isPreWarning = (relativeDist >= 150 && relativeDist <= 280) && obs.type !== 'trafficLight' && obs.type !== 'windChime';
+                const isCriticalWindow = (relativeDist >= 80 && relativeDist <= 150) && obs.type !== 'trafficLight' && obs.type !== 'windChime';
+
+                sonarWaves.forEach(w => {
+                    if (w.obsId === obs.id) {
+                        let strokeColor = currentStage === 1 ? `rgba(16, 185, 129, ${w.opacity * 0.45})` : currentStage === 2 ? `rgba(59, 130, 246, ${w.opacity * 0.45})` : `rgba(245, 158, 11, ${w.opacity * 0.45})`;
+                        let lineWidth = 2;
+
+                        if (isCriticalWindow) {
+                            strokeColor = `rgba(239, 68, 68, ${w.opacity * 0.9})`; 
+                            lineWidth = 4.5;
+                        } else if (isPreWarning) {
+                            strokeColor = `rgba(248, 113, 113, ${w.opacity * 0.6})`; 
+                            lineWidth = 3;
+                        }
+
+                        ctx.strokeStyle = strokeColor; ctx.lineWidth = lineWidth; 
+                        ctx.beginPath(); ctx.arc(w.x, w.y, w.radius, 0, Math.PI * 2); ctx.stroke();
+                    }
+                });
+
+                if ((isCriticalWindow || isPreWarning) && player.knockbackFrames === 0) {
+                    ctx.fillStyle = isCriticalWindow ? 'rgba(239, 68, 68, 0.25)' : 'rgba(248, 113, 113, 0.1)';
+                    ctx.fillRect(player.x + 50, 413, relativeDist - 50, 6);
+                    ctx.strokeStyle = isCriticalWindow ? '#ef4444' : '#fca5a5'; ctx.lineWidth = isCriticalWindow ? 4 : 2; 
+                    ctx.beginPath(); ctx.moveTo(player.x + 80, 415); ctx.lineTo(player.x + 150, 415); ctx.stroke();
+                    if (isCriticalWindow && Math.random() < 0.25) playSynthSound(950, 'sine', 0.08, 0.06);
+                }
+            });
+            ctx.restore();
+
+            // [레이어 7] 상단 HUD 하트 및 진행 표시
+            for (let i = 0; i < player.maxLives; i++) {
+                ctx.save(); ctx.translate(35 + i * 40, 40);
+                ctx.fillStyle = i < player.lives ? '#f43f5e' : '#1e293b'; 
+                ctx.beginPath(); ctx.moveTo(0, -6); ctx.bezierCurveTo(-6, -12, -15, -6, -15, 3); ctx.bezierCurveTo(-15, 12, -4, 18, 0, 26); ctx.bezierCurveTo(4, 18, 15, 12, 15, 3); ctx.bezierCurveTo(15, -6, 6, -12, 0, -6); ctx.closePath(); ctx.fill(); ctx.restore();
+            }
+
+            const distancePercent = Math.min(1, player.x / STAGE_END_X[currentStage]);
+            ctx.fillStyle = '#111827'; ctx.fillRect(300, 30, 300, 10);
+            ctx.fillStyle = currentStage === 1 ? '#10b981' : currentStage === 2 ? '#3b82f6' : '#f59e0b'; ctx.fillRect(300, 30, 300 * distancePercent, 10);
+            ctx.fillStyle = '#f1f5f9'; ctx.font = 'bold 13px Noto Sans KR'; ctx.textAlign = 'right'; ctx.fillText(`Stage 0${currentStage}`, 285, 40);
+            ctx.textAlign = 'left'; ctx.fillText(`${Math.floor(player.x / 100)}m / ${Math.floor(STAGE_END_X[currentStage] / 100)}m`, 615, 40);
+        }
+
+        function loop() { update(); draw(); requestAnimationFrame(loop); }
+        loop();
+    </script>
+</body>
+</html>
