@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>가려진 길 (The Way Home)</title>
+    <!-- Tailwind CSS 탑재 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;700;900&display=swap');
+        body {
+            font-family: 'Noto Sans KR', sans-serif;
+            background-color: #020617; 
+            margin: 0; padding: 0;
+            display: flex; justify-content: center; align-items: center; height: 100vh;
+            background-image: radial-gradient(circle at center, #1e293b 0%, #020617 100%);
+        }
+        .canvas-glow {
+            box-shadow: 0 0 50px rgba(45, 212, 191, 0.4), 0 0 15px rgba(167, 139, 250, 0.3);
+            border: 2px solid rgba(45, 212, 191, 0.3);
+        }
+    </style>
+</head>
+<body class="overflow-hidden h-screen text-gray-100 selection:bg-teal-500 selection:text-black w-full">
+
+    <div class="relative canvas-glow rounded-3xl overflow-hidden shadow-2xl">
+        <canvas id="gameCanvas" width="900" height="600" class="block" oncontextmenu="return false;"></canvas>
+        
+        <div id="startOverlay" class="absolute inset-0 bg-slate-900/80 flex flex-col justify-center items-center text-center p-8 transition-all duration-700 z-50 backdrop-blur-md">
+            <h2 class="text-6xl font-black text-teal-100 tracking-widest uppercase mb-10" style="text-shadow: 0 0 40px rgba(45,212,191,0.8), 0 0 10px rgba(255,255,255,0.5);">가려진 길</h2>
+            <button id="startButton" class="px-10 py-4 bg-gradient-to-r from-teal-400 to-emerald-500 text-slate-900 font-extrabold rounded-full hover:from-teal-300 hover:to-emerald-400 active:scale-95 transition-all text-lg tracking-widest shadow-[0_0_25px_rgba(45,212,191,0.6)]">
+                여정 시작하기
+            </button>
+        </div>
+
+        <div id="endingOverlay" class="absolute inset-0 bg-white/90 text-slate-900 flex flex-col justify-center items-center text-center p-8 opacity-0 pointer-events-none transition-all duration-1000 z-50 backdrop-blur-lg">
+            <span class="text-5xl mb-4">🏠</span>
+            <h2 class="text-5xl font-extrabold mt-4 text-teal-900 tracking-tight">다녀왔습니다</h2>
+            <p class="text-base text-slate-700 mt-6 max-w-md leading-relaxed font-bold">
+                세상의 모든 낯설고 두려운 경고음을 건너,<br>
+                마침내 엄마와 할머니가 기다리는 포근한 집에 무사히 도착했습니다.
+            </p>
+            <p class="text-sm text-slate-500 mt-10 leading-relaxed italic">
+                "보이지 않는다고 해서 길이 없는 것은 아닙니다.<br>
+                길은 언제나 당신의 발끝과 귀끝, 그리고 용기 속에 닿아 있습니다."
+            </p>
+            <button onclick="location.reload()" class="mt-12 px-8 py-3 bg-teal-600 text-white font-bold rounded-full hover:bg-teal-500 active:scale-95 transition-all text-sm shadow-xl">
+                다시 시작하기
+            </button>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const startOverlay = document.getElementById('startOverlay');
+        const startButton = document.getElementById('startButton');
+        const endingOverlay = document.getElementById('endingOverlay');
+
+        let audioCtx = null;
+
+        function playSynthSound(freq, type, duration, vol = 0.1) {
+            if (!audioCtx) return;
+            try {
+                const osc = audioCtx.createOscillator(); const gain = audioCtx.createGain();
+                osc.type = type; osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+                gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+                osc.connect(gain); gain.connect(audioCtx.destination);
+                osc.start(); osc.stop(audioCtx.currentTime + duration);
+            } catch (e) {}
+        }
+
+        let gameActive = false;
+        let currentStage = 1; 
+        let targetSpeed = 5.0; 
+        let finalCleared = false;
+        let holdEffectTimer = 0; 
+        let prevHoldState = false;
+
+        // 물리 키 상태 관리 (멈칫거림 방지)
+        const physicalKeys = { hold: false };
+
+        const globalTraffic = {
+            isRed: false,
+            timer: 360, 
+            ttsSpoken: true, 
+            gracePeriod: 0 
+        };
+
+        const player = {
+            x: 150, y: 400, vy: 0, gravity: 0.8, jumpForce: -15.5, 
+            isJumping: false, speed: 0, radius: 16,
+            lives: 3, maxLives: 3, knockbackFrames: 0, invulFrames: 0, trail: []
+        };
+
+        const groundY = 400;
+        let cameraX = 0;
+        const failureScars = { 1: [], 2: [], 3: [] };
+        const STAGE_END_X = { 1: 6800, 2: 7200, 3: 6500 };
+        let sonarWaves = [];
+
+        function speakTTS(message) {
+            try {
+                if ('speechSynthesis' in window) {
+                    window.speechSynthesis.cancel();
+                    const utterance = new SpeechSynthesisUtterance(message);
+                    utterance.lang = 'ko-KR'; utterance.rate = 1.1; utterance.volume = 0.95;
+                    window.speechSynthesis.speak(utterance);
+                }
+            } catch (e) {}
+        }
+
+        const obstacles = {
+            1: [ 
+                { id: 101, x: 800, type: 'dog', w: 85, h: 50 }, { id: 102, x: 1500, type: 'frog', w: 50, h: 45, yOffset: 0 },
+                { id: 103, x: 2200, type: 'bush', w: 60, h: 60 }, { id: 104, x: 2800, type: 'mushroom', w: 45, h: 65 },
+                { id: 105, x: 3500, type: 'dog', w: 85, h: 50 }, { id: 106, x: 4200, type: 'frog', w: 50, h: 45, yOffset: 0 },
+                { id: 107, x: 4900, type: 'bush', w: 60, h: 60 }, { id: 108, x: 5600, type: 'mushroom', w: 45, h: 65 },
+                { id: 109, x: 6200, type: 'frog', w: 50, h: 45, yOffset: 0 }
+            ],
+            2: [ 
+                { id: 201, x: 900, type: 'trafficLight', w: 60, h: 220 }, 
+                { id: 202, x: 1700, type: 'vent', w: 90, h: 15 },
+                { id: 203, x: 2500, type: 'bicycle', w: 80, h: 70 },
+                { id: 204, x: 3300, type: 'trafficLight', w: 60, h: 220 },
+                { id: 205, x: 4100, type: 'vent', w: 90, h: 15 },
+                { id: 206, x: 4900, type: 'bicycle', w: 80, h: 70 },
+                { id: 207, x: 5700, type: 'trafficLight', w: 60, h: 220 },
+                { id: 208, x: 6500, type: 'bicycle', w: 80, h: 70 }
+            ],
+            3: [ 
+                { id: 301, x: 600, type: 'windChime', w: 40, h: 120, ringTimer: 0 }, 
+                { id: 302, x: 1100, type: 'clock', w: 55, h: 95 }, 
+                { id: 303, x: 1800, type: 'fearWall', w: 70, h: 80 }, 
+                { id: 304, x: 2300, type: 'windChime', w: 40, h: 120, ringTimer: 0 }, 
+                { id: 305, x: 2900, type: 'window', w: 20, h: 140 }, 
+                { id: 306, x: 3600, type: 'clock', w: 55, h: 95 },
+                { id: 307, x: 4200, type: 'windChime', w: 40, h: 120, ringTimer: 0 },
+                { id: 308, x: 4800, type: 'rockingChair', w: 65, h: 75 },
+                { id: 309, x: 5500, type: 'window', w: 20, h: 140 }
+            ]
+        };
+
+        const bgAssets = {
+            stars: Array.from({ length: 60 }, () => ({ x: Math.random() * 900, y: Math.random() * 250, r: Math.random() * 2 + 0.5, alpha: Math.random() })),
+            spiroTrees: Array.from({ length: 12 }, (_, i) => ({ x: i * 700 + 100, size: 80 + Math.random() * 60, leafCount: 5 + Math.floor(Math.random() * 4) })),
+            cityBuildings: Array.from({ length: 15 }, (_, i) => ({ x: i * 500, w: 120 + Math.random() * 100, h: 250 + Math.random() * 180 })),
+            homeInterior: Array.from({ length: 10 }, (_, i) => ({ x: i * 700, type: ['lamp', 'frame', 'curtain'][i % 3] }))
+        };
+
+        startButton.addEventListener('click', () => {
+            try { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+            startOverlay.style.opacity = '0';
+            setTimeout(() => { startOverlay.style.display = 'none'; gameActive = true; player.speed = targetSpeed; }, 500);
+        });
+
+        // 독립된 즉각 점프 로직
+        function executeJump() {
+            if (!gameActive || finalCleared || player.knockbackFrames > 0) return;
+            if (!player.isJumping && player.y >= groundY) {
+                player.vy = player.jumpForce;
+                player.isJumping = true;
+                playSynthSound(300, 'square', 0.25, 0.15); 
+            }
+        }
+
+        window.addEventListener('keydown', (e) => {
+            if (!gameActive || finalCleared) return;
+            if (e.code === 'Space') { e.preventDefault(); executeJump(); }
+            if (e.key === 'Shift' || e.code === 'ShiftLeft' || e.code === 'ShiftRight' || e.code === 'ArrowDown') { physicalKeys.hold = true; }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.key === 'Shift' || e.code === 'ShiftLeft' || e.code === 'ShiftRight' || e.code === 'ArrowDown') { physicalKeys.hold = false; }
+        });
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (!gameActive || finalCleared) return;
+            if (e.button === 0) { executeJump(); } 
+            if (e.button === 2) { physicalKeys.hold = true; } 
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (e.button === 2) { physicalKeys.hold = false; }
+        });
+
+        window.addEventListener('blur', () => { physicalKeys.hold = false; });
+
+        function triggerCollision(obstacleX) {
+            player.lives--; player.invulFrames = 60; player.knockbackFrames = 25;
+            playSynthSound(100, 'sawtooth', 0.5, 0.3);
+            failureScars[currentStage].push({ x: player.x, y: player.y });
+
+            if (player.lives <= 0) {
+                player.lives = player.maxLives; player.x = 150; player.y = groundY; player.vy = 0; player.isJumping = false; cameraX = 0;
+                if (currentStage === 2) {
+                    globalTraffic.isRed = false; globalTraffic.timer = 360; globalTraffic.ttsSpoken = false; globalTraffic.gracePeriod = 0;
+                }
+                playSynthSound(80, 'sine', 0.9, 0.4);
+            } else { player.vy = -7; }
+        }
+
+        function update() {
+            if (!gameActive || finalCleared) return;
+
+            let isHolding = physicalKeys.hold;
+
+            if (isHolding && !prevHoldState && player.knockbackFrames === 0 && player.y >= groundY) {
+                playSynthSound(150, 'sawtooth', 0.15, 0.05); holdEffectTimer = 0;
+            }
+            prevHoldState = isHolding;
+            if (isHolding) holdEffectTimer++;
+            if (player.invulFrames > 0) player.invulFrames--;
+
+            if (player.knockbackFrames > 0) {
+                player.knockbackFrames--; player.speed = -4.5; 
+                player.vy += player.gravity; player.y += player.vy;
+                if (player.y >= groundY) { player.y = groundY; player.vy = 0; player.isJumping = false; }
+                player.x += player.speed; player.x = Math.max(150, player.x); cameraX = player.x - 200; sonarWaves = []; 
+            } else {
+                player.speed = isHolding ? 0 : targetSpeed; 
+                player.vy += player.gravity; player.y += player.vy;
+                if (player.y >= groundY) {
+                    player.y = groundY;
+                    if (player.vy > 0) { player.vy = 0; if (player.isJumping) { player.isJumping = false; playSynthSound(130, 'triangle', 0.1, 0.1); } }
+                }
+                player.x += player.speed; cameraX = player.x - 200;
+            }
+
+            if (player.speed > 0 && Math.abs(player.vy) > 0.1) {
+                player.trail.push({ x: player.x, y: player.y, r: 8 });
+                if (player.trail.length > 25) player.trail.shift();
+            } else { if (player.trail.length > 0) player.trail.shift(); }
+
+            if (currentStage === 2) {
+                globalTraffic.timer--;
+
+                if (globalTraffic.timer > 0 && globalTraffic.timer <= 90) {
+                    if (globalTraffic.timer % 30 === 0) playSynthSound(800, 'square', 0.1, 0.05); 
+                }
+
+                if (globalTraffic.timer <= 0) {
+                    globalTraffic.isRed = !globalTraffic.isRed;
+                    globalTraffic.timer = globalTraffic.isRed ? 240 : 360; 
+                    globalTraffic.ttsSpoken = false; 
+                    globalTraffic.gracePeriod = 25; 
+                }
+
+                if (!globalTraffic.ttsSpoken) {
+                    if (globalTraffic.isRed) speakTTS("빨간불입니다. 멈추세요.");
+                    else speakTTS("초록불입니다. 건너가세요.");
+                    globalTraffic.ttsSpoken = true;
+                }
+
+                if (globalTraffic.isRed) {
+                    if (globalTraffic.gracePeriod > 0) {
+                        globalTraffic.gracePeriod--;
+                    } else if (!isHolding && player.knockbackFrames === 0 && player.invulFrames === 0) {
+                        triggerCollision(player.x);
+                    }
+                }
+            }
+
+            const obsList = obstacles[currentStage];
+            
+            if (Math.random() < 0.02) {
+                obsList.forEach(obs => {
+                    if (obs.x > cameraX && obs.x < cameraX + 1100 && obs.type !== 'windChime') {
+                        sonarWaves.push({ obsId: obs.id, x: obs.x + (obs.w ? obs.w/2 : 25), y: 380, radius: 1, maxRadius: 380, opacity: 1 });
+                    }
+                });
+            }
+
+            sonarWaves.forEach(w => { w.radius += 3.5; w.opacity = 1 - (w.radius / w.maxRadius); });
+            sonarWaves = sonarWaves.filter(w => w.radius < w.maxRadius);
+
+            obsList.forEach(obs => {
+                if (obs.type === 'frog') {
+                    if (!obs.jumpState) obs.jumpState = 0;
+                    obs.timer = (obs.timer || 0) + 1;
+                    if (obs.timer > 120) { obs.yOffset = Math.sin((obs.timer - 120) * 0.08) * 110; if (obs.yOffset >= 0) { obs.yOffset = 0; obs.timer = 0; }
+                    } else { obs.yOffset = 0; }
+                }
+
+                if (obs.type === 'windChime') {
+                    const distToChime = Math.abs(obs.x - player.x);
+                    if (distToChime < 350) {
+                        obs.ringTimer = (obs.ringTimer || 0) + 1;
+                        if (obs.ringTimer % 80 === 1) {
+                            playSynthSound(1046.50, 'sine', 0.35, 0.08); 
+                            setTimeout(() => playSynthSound(1318.51, 'sine', 0.25, 0.06), 80); 
+                            setTimeout(() => playSynthSound(1567.98, 'sine', 0.35, 0.05), 160); 
+                        }
+                    } else { obs.ringTimer = 0; }
+                }
+
+                if (obs.type === 'clock') {
+                    obs.tickTimer = (obs.tickTimer || 0) + 1;
+                    if (obs.tickTimer % 45 === 0) playSynthSound(220, 'triangle', 0.05, 0.1);
+                    else if (obs.tickTimer % 45 === 22) playSynthSound(180, 'triangle', 0.05, 0.08); 
+                }
+
+                if (player.invulFrames === 0 && player.knockbackFrames === 0) {
+                    if (obs.type === 'fearWall' || obs.type === 'windChime') return; 
+
+                    let hitX = obs.x + (obs.w || 50) * 0.15; let hitW = (obs.w || 50) * 0.7;        
+                    let hitH = (obs.h || 50) * 0.75; let hitY = groundY - hitH;
+                    if (obs.type === 'frog' && obs.yOffset) hitY += obs.yOffset; 
+                    if (obs.type === 'trafficLight') { hitX = obs.x + 20; hitW = 20; hitH = obs.h || 220; hitY = groundY - hitH; }
+
+                    const px = player.x; const py = player.y; const colRadius = 11;
+                    if (px + colRadius > hitX && px - colRadius < hitX + hitW && py + colRadius > hitY && py - colRadius < hitY + hitH) {
+                        if (obs.type === 'vent') { player.vy = -20; player.isJumping = true; playSynthSound(550, 'sine', 0.4, 0.2); } 
+                        else if (obs.type === 'mushroom') {
+                            if (player.vy > 0 && py < (groundY - hitH) + 15) { player.vy = -17; player.isJumping = true; playSynthSound(450, 'triangle', 0.35, 0.15); } 
+                            else triggerCollision(obs.x); 
+                        } else if (obs.type === 'trafficLight') {
+                            if (globalTraffic.isRed) triggerCollision(obs.x);
+                        } else triggerCollision(obs.x);
+                    }
+                }
+            });
+
+            if (player.x >= STAGE_END_X[currentStage]) {
+                if (currentStage < 3) {
+                    currentStage++; player.x = 150; player.y = groundY; player.vy = 0; cameraX = 0;
+                    player.lives = player.maxLives;
+                    
+                    if (currentStage === 2) {
+                        globalTraffic.isRed = false; globalTraffic.timer = 360; globalTraffic.ttsSpoken = false; globalTraffic.gracePeriod = 0;
+                    }
+                    playSynthSound(600, 'sine', 0.6, 0.2);
+                } else {
+                    finalCleared = true; endingOverlay.style.opacity = '1'; endingOverlay.style.pointerEvents = 'auto';
+                    // 💡 엔딩 TTS 삭제됨
+                }
+            }
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, 900, 600);
+
+            let bgGrad = ctx.createLinearGradient(0, 0, 0, 600);
+            if (currentStage === 1) { bgGrad.addColorStop(0, '#0f766e'); bgGrad.addColorStop(1, '#020617'); } 
+            else if (currentStage === 2) { bgGrad.addColorStop(0, '#4c1d95'); bgGrad.addColorStop(1, '#020617'); } 
+            else { bgGrad.addColorStop(0, '#9a3412'); bgGrad.addColorStop(1, '#2e1065'); }
+            ctx.fillStyle = bgGrad; ctx.fillRect(0, 0, 900, 600);
+
+            ctx.save(); ctx.translate(-cameraX, 0);
+
+            if (currentStage === 1) {
+                bgAssets.stars.forEach(s => { ctx.fillStyle = `rgba(255, 255, 255, ${s.alpha * 0.9})`; ctx.beginPath(); ctx.arc(s.x + cameraX * 0.25, s.y, s.r, 0, Math.PI * 2); ctx.fill(); });
+                bgAssets.spiroTrees.forEach(t => {
+                    if (t.x < cameraX - 200 || t.x > cameraX + 1100) return;
+                    ctx.strokeStyle = 'rgba(52, 211, 153, 0.7)'; ctx.lineWidth = 1.5; 
+                    for (let j = 0; j < t.leafCount; j++) { ctx.beginPath(); ctx.ellipse(t.x, 260, t.size * 0.5, t.size, (j * Math.PI) / t.leafCount, 0, Math.PI * 2); ctx.stroke(); }
+                    ctx.strokeStyle = 'rgba(52, 211, 153, 0.9)'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(t.x, 260); ctx.lineTo(t.x, 415); ctx.stroke();
+                });
+            } else if (currentStage === 2) {
+                bgAssets.cityBuildings.forEach((b, idx) => {
+                    if (b.x < cameraX - 300 || b.x > cameraX + 1100) return;
+                    ctx.fillStyle = 'rgba(96, 165, 250, 0.3)'; ctx.strokeStyle = 'rgba(96, 165, 250, 0.6)'; ctx.lineWidth = 1.5;
+                    ctx.fillRect(b.x + cameraX*0.1, 415 - b.h, b.w, b.h); ctx.strokeRect(b.x + cameraX*0.1, 415 - b.h, b.w, b.h);
+                    ctx.fillStyle = 'rgba(253, 224, 71, 0.95)'; 
+                    for (let wx = 15; wx < b.w - 15; wx += 25) { for (let wy = 20; wy < b.h - 20; wy += 35) { if ((wx + wy + idx) % 5 === 0) ctx.fillRect(b.x + cameraX*0.1 + wx, 415 - b.h + wy, 8, 12); } }
+                });
+            } else {
+                bgAssets.homeInterior.forEach((asset, idx) => {
+                    const ax = idx * 600 + 200; if (ax < cameraX - 200 || ax > cameraX + 1100) return;
+                    ctx.strokeStyle = 'rgba(251, 191, 36, 0.8)'; ctx.lineWidth = 2.5; 
+                    if (asset.type === 'lamp') {
+                        ctx.beginPath(); ctx.moveTo(ax, 415); ctx.lineTo(ax, 280); ctx.moveTo(ax - 20, 280); ctx.lineTo(ax + 20, 280); ctx.lineTo(ax + 10, 250); ctx.lineTo(ax - 10, 250); ctx.closePath(); ctx.stroke();
+                        let lampGrad = ctx.createRadialGradient(ax, 260, 5, ax, 320, 70); lampGrad.addColorStop(0, 'rgba(253, 224, 71, 0.6)'); lampGrad.addColorStop(1, 'rgba(253, 224, 71, 0)');
+                        ctx.fillStyle = lampGrad; ctx.beginPath(); ctx.arc(ax, 260, 70, 0, Math.PI, false); ctx.fill();
+                    } else if (asset.type === 'frame') {
+                        ctx.strokeRect(ax, 230, 80, 60); ctx.beginPath(); ctx.moveTo(ax + 10, 280); ctx.lineTo(ax + 40, 245); ctx.lineTo(ax + 70, 280); ctx.stroke();
+                    }
+                });
+            }
+
+            failureScars[currentStage].forEach(scar => {
+                ctx.strokeStyle = '#f43f5e'; ctx.lineWidth = 2.5;
+                ctx.beginPath(); ctx.moveTo(scar.x - 10, scar.y - 10); ctx.lineTo(scar.x + 10, scar.y + 10); ctx.moveTo(scar.x + 10, scar.y - 10); ctx.lineTo(scar.x - 10, scar.y + 10); ctx.stroke();
+                ctx.fillStyle = 'rgba(244, 63, 94, 0.15)'; ctx.beginPath(); ctx.arc(scar.x, scar.y, 18, 0, Math.PI*2); ctx.fill();
+            });
+
+            ctx.strokeStyle = currentStage === 1 ? '#059669' : currentStage === 2 ? '#2563eb' : '#b45309'; ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.moveTo(cameraX, 415); ctx.lineTo(cameraX + 900, 415); ctx.stroke();
+            ctx.fillStyle = currentStage === 1 ? 'rgba(5, 150, 105, 0.1)' : currentStage === 2 ? 'rgba(37, 99, 235, 0.1)' : 'rgba(180, 83, 9, 0.1)'; ctx.fillRect(cameraX, 415, 900, 185);
+
+            const obsList = obstacles[currentStage];
+            obsList.forEach(obs => {
+                let obsY = groundY - (obs.h || 50); if (obs.type === 'frog' && obs.yOffset) obsY += obs.yOffset;
+                ctx.save(); ctx.translate(obs.x, obsY);
+                if (obs.type === 'dog') {
+                    ctx.fillStyle = '#d97706'; ctx.beginPath(); ctx.ellipse(45, 33, 30, 18, 0, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(18, 25, 12, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#b45309'; ctx.beginPath(); ctx.ellipse(15, 29, 6, 12, 0.2, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#d97706'; ctx.beginPath(); ctx.arc(30, 45, 6, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(60, 45, 6, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#1e293b'; ctx.beginPath(); ctx.arc(12, 24, 1.5, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(9, 28, 2, 0, Math.PI*2); ctx.fill();  
+                } else if (obs.type === 'frog') {
+                    ctx.fillStyle = '#059669'; ctx.beginPath(); ctx.ellipse(25, 25, 22, 16, 0, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(25, 15, 11, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(19, 10, 4, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(31, 10, 4, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#000000'; ctx.beginPath(); ctx.arc(19, 10, 2, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(31, 10, 2, 0, Math.PI*2); ctx.fill();
+                } else if (obs.type === 'bush') {
+                    ctx.fillStyle = '#065f46'; ctx.beginPath(); ctx.arc(20, 35, 22, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(40, 30, 25, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(28, 18, 20, 0, Math.PI*2); ctx.fill();
+                    ctx.fillStyle = '#f43f5e'; ctx.beginPath(); ctx.arc(15, 25, 4.5, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(38, 20, 4, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(25, 38, 5, 0, Math.PI*2); ctx.fill();
+                } else if (obs.type === 'mushroom') {
+                    ctx.fillStyle = '#f472b6'; ctx.beginPath(); ctx.ellipse(22, 18, 22, 13, 0, 0, Math.PI*2); ctx.fill(); ctx.fillStyle = '#f1f5f9'; ctx.fillRect(16, 18, 12, 35);
+                } else if (obs.type === 'trafficLight') {
+                    ctx.fillStyle = '#334155'; ctx.fillRect(25, 0, 10, 220); ctx.fillStyle = '#1e293b'; ctx.fillRect(5, 10, 50, 95);  
+                    
+                    // 💡 빛 효과(노란색, 빨간색 점멸 오버레이)는 삭제되었지만, 신호등 기둥 오브젝트의 빨간/초록 원 색깔은 바뀝니다.
+                    ctx.fillStyle = globalTraffic.isRed ? '#ef4444' : '#1e293b'; ctx.beginPath(); ctx.arc(30, 35, 16, 0, Math.PI*2); ctx.fill(); 
+                    if (globalTraffic.isRed) { ctx.shadowColor = '#f87171'; ctx.shadowBlur = 18; ctx.fillStyle = '#fecaca'; ctx.beginPath(); ctx.arc(30, 35, 10, 0, Math.PI*2); ctx.fill(); ctx.shadowBlur = 0; }
+                    
+                    ctx.fillStyle = !globalTraffic.isRed ? '#10b981' : '#1e293b'; ctx.beginPath(); ctx.arc(30, 78, 16, 0, Math.PI*2); ctx.fill(); 
+                    if (!globalTraffic.isRed) { ctx.shadowColor = '#34d399'; ctx.shadowBlur = 18; ctx.fillStyle = '#a7f3d0'; ctx.beginPath(); ctx.arc(30, 78, 10, 0, Math.PI*2); ctx.fill(); ctx.shadowBlur = 0; }
+                } else if (obs.type === 'vent') {
+                    ctx.fillStyle = '#475569'; ctx.fillRect(0, 0, obs.w, obs.h); ctx.fillStyle = '#0f172a'; for (let vx = 5; vx < obs.w; vx += 12) { ctx.fillRect(vx, 2, 4, 11); }
+                    ctx.strokeStyle = 'rgba(255,255,255,0.3)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(30, -5); ctx.lineTo(30, -50); ctx.moveTo(60, -5); ctx.lineTo(60, -45); ctx.stroke();
+                } else if (obs.type === 'bicycle') {
+                    ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(18, 48, 18, 0, Math.PI*2); ctx.stroke(); ctx.beginPath(); ctx.arc(62, 48, 18, 0, Math.PI*2); ctx.stroke(); ctx.beginPath(); ctx.moveTo(18, 48); ctx.lineTo(38, 48); ctx.lineTo(50, 20); ctx.lineTo(26, 20); ctx.closePath(); ctx.stroke();
+                } else if (obs.type === 'fearWall') {
+                    ctx.strokeStyle = 'rgba(244, 63, 94, 0.45)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, 80); ctx.lineTo(35, 10); ctx.lineTo(70, 80); ctx.moveTo(15, 80); ctx.lineTo(35, 30); ctx.lineTo(55, 80); ctx.stroke();
+                } else if (obs.type === 'window') {
+                    ctx.fillStyle = 'rgba(56, 189, 248, 0.35)'; ctx.fillRect(0, 0, obs.w, obs.h); ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 2; ctx.strokeRect(0, 0, obs.w, obs.h);
+                } else if (obs.type === 'rockingChair') {
+                    ctx.strokeStyle = '#d97706'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(32, 20, 50, 0.4, Math.PI - 0.4, false); ctx.stroke(); ctx.beginPath(); ctx.moveTo(15, 35); ctx.lineTo(50, 35); ctx.moveTo(25, 35); ctx.lineTo(25, 65); ctx.moveTo(45, 35); ctx.lineTo(45, 65); ctx.moveTo(18, 35); ctx.lineTo(18, 5); ctx.stroke();
+                } else if (obs.type === 'windChime') {
+                    ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(20, 0); ctx.lineTo(20, 40); ctx.stroke(); 
+                    ctx.fillStyle = '#fdbaf8'; ctx.beginPath(); ctx.ellipse(20, 40, 15, 8, 0, 0, Math.PI*2); ctx.fill(); 
+                    ctx.strokeStyle = '#f3e8ff'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(20, 48); ctx.lineTo(20, 95); ctx.stroke(); 
+                    ctx.fillStyle = 'rgba(56, 189, 248, 0.35)'; ctx.fillRect(14, 75, 12, 35); ctx.strokeRect(14, 75, 12, 35);
+                } else if (obs.type === 'clock') {
+                    ctx.fillStyle = '#78350f'; ctx.fillRect(0, 0, obs.w, obs.h); ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2.5; ctx.strokeRect(0, 0, obs.w, obs.h);
+                    ctx.fillStyle = '#fef08a'; ctx.beginPath(); ctx.arc(27, 28, 16, 0, Math.PI*2); ctx.fill(); ctx.fillStyle = '#fbbf24'; ctx.beginPath(); ctx.arc(27, 28, 2, 0, Math.PI*2); ctx.fill(); 
+                    const angle = Math.sin((obs.tickTimer || 0) * 0.08) * 0.35;
+                    ctx.save(); ctx.translate(27, 45); ctx.rotate(angle); ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, 35); ctx.stroke(); ctx.fillStyle = '#fbbf24'; ctx.beginPath(); ctx.arc(0, 35, 7, 0, Math.PI*2); ctx.fill(); ctx.restore();
+                }
+                ctx.restore();
+            });
+            ctx.restore(); 
+
+            // 💡 [핵심 픽스]: 직진형 진행 방향 안개 마스크 (통과 시점 배경 노출)
+            ctx.save();
+            // 화면 상의 캐릭터 중심부(X좌표: player.x - cameraX)를 기점으로 마스크 경계 생성
+            const maskStartX = player.x - cameraX - 10; 
+            const maskEndX = player.x - cameraX + 50;   
+            
+            let darkGrad = ctx.createLinearGradient(maskStartX, 0, maskEndX, 0);
+            darkGrad.addColorStop(0, 'rgba(2, 6, 23, 0)');     // 캐릭터가 밟고 지나간 뒷길은 100% 투명하게 드러남!
+            darkGrad.addColorStop(1, 'rgba(2, 6, 23, 0.99)');  // 캐릭터보다 앞길은 99% 칠흑같이 어두움
+            
+            ctx.fillStyle = darkGrad; 
+            // 캔버스 오른쪽 전체를 장막으로 덮음 (장애물을 넘는 순간 왼쪽 투명 영역으로 빠져나가며 정체가 밝혀짐)
+            ctx.fillRect(maskStartX, 0, 900, 600);
+
+            if (currentStage === 3) {
+                obstacles[3].forEach(obs => {
+                    if (obs.type === 'windChime' && obs.ringTimer > 0) {
+                        const chimeWaveSize = (obs.ringTimer % 80) * 4.5; const screenObsX = obs.x - cameraX;
+                        let revealGrad = ctx.createRadialGradient(screenObsX + 20, groundY - 60, 5, screenObsX + 20, groundY - 60, Math.min(320, chimeWaveSize + 80));
+                        revealGrad.addColorStop(0, 'rgba(253, 224, 71, 0.35)'); revealGrad.addColorStop(0.7, 'rgba(253, 224, 71, 0.15)'); revealGrad.addColorStop(1, 'rgba(2, 6, 23, 0)');
+                        ctx.fillStyle = revealGrad; ctx.beginPath(); ctx.arc(screenObsX + 20, groundY - 60, Math.min(320, chimeWaveSize + 80), 0, Math.PI*2); ctx.fill();
+                    }
+                });
+            }
+            ctx.restore();
+
+            ctx.save(); ctx.translate(-cameraX, 0);
+            
+            let isHolding = physicalKeys.hold;
+            ctx.save(); ctx.translate(player.x, player.y);
+            player.trail.forEach((p, idx) => { ctx.fillStyle = `rgba(253, 224, 71, ${idx * 0.04})`; ctx.beginPath(); ctx.arc(p.x - player.x, p.y - player.y, player.radius * (idx / 25), 0, Math.PI*2); ctx.fill(); });
+            
+            if (isHolding && player.y >= groundY) {
+                ctx.strokeStyle = `rgba(56, 189, 248, ${0.6 + Math.sin(holdEffectTimer * 0.2) * 0.4})`; ctx.lineWidth = 3; ctx.setLineDash([5, 5]);
+                ctx.beginPath(); ctx.arc(0, 0, player.radius + 14, 0, Math.PI*2); ctx.stroke(); ctx.setLineDash([]); 
+                ctx.fillStyle = 'rgba(56, 189, 248, 0.35)'; ctx.beginPath(); ctx.ellipse(0, player.radius, 20, 5, 0, 0, Math.PI*2); ctx.fill();
+            }
+
+            if (player.invulFrames === 0 || player.invulFrames % 4 < 2) {
+                let plGrad = ctx.createRadialGradient(0, -2, 2, 0, 0, player.radius); plGrad.addColorStop(0, '#fef08a'); plGrad.addColorStop(1, '#facc15'); 
+                ctx.fillStyle = plGrad; ctx.shadowColor = '#fef08a'; ctx.shadowBlur = 15; 
+                ctx.beginPath(); ctx.arc(0, 0, player.radius, 0, Math.PI*2); ctx.fill(); ctx.shadowBlur = 0;
+                ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath(); ctx.arc(-5, -2, 2.5, 0.2, Math.PI - 0.2, false); ctx.arc(5, -2, 2.5, 0.2, Math.PI - 0.2, false); ctx.stroke();
+            }
+            ctx.restore();
+
+            obsList.forEach(obs => {
+                const relativeDist = obs.x - player.x;
+                const isPreWarning = (relativeDist >= 150 && relativeDist <= 280) && obs.type !== 'windChime';
+                const isCriticalWindow = (relativeDist >= 80 && relativeDist <= 150) && obs.type !== 'windChime';
+
+                sonarWaves.forEach(w => {
+                    if (w.obsId === obs.id) {
+                        let strokeColor = currentStage === 1 ? `rgba(52, 211, 153, ${w.opacity * 0.6})` : currentStage === 2 ? `rgba(96, 165, 250, ${w.opacity * 0.6})` : `rgba(251, 191, 36, ${w.opacity * 0.6})`;
+                        let lineWidth = 2.5;
+
+                        if (isCriticalWindow) { strokeColor = `rgba(239, 68, 68, ${w.opacity * 1.0})`; lineWidth = 5; } 
+                        else if (isPreWarning) { strokeColor = `rgba(248, 113, 113, ${w.opacity * 0.8})`; lineWidth = 3.5; }
+
+                        ctx.strokeStyle = strokeColor; ctx.lineWidth = lineWidth; 
+                        ctx.beginPath(); ctx.arc(w.x, w.y, w.radius, 0, Math.PI * 2); ctx.stroke();
+                    }
+                });
+
+                if ((isCriticalWindow || isPreWarning) && player.knockbackFrames === 0) {
+                    ctx.fillStyle = isCriticalWindow ? 'rgba(239, 68, 68, 0.3)' : 'rgba(248, 113, 113, 0.15)';
+                    ctx.fillRect(player.x + 50, 413, relativeDist - 50, 6);
+                    ctx.strokeStyle = isCriticalWindow ? '#ef4444' : '#fca5a5'; ctx.lineWidth = isCriticalWindow ? 5 : 3; 
+                    ctx.shadowColor = '#ef4444'; ctx.shadowBlur = 10;
+                    ctx.beginPath(); ctx.moveTo(player.x + 80, 415); ctx.lineTo(player.x + 150, 415); ctx.stroke();
+                    ctx.shadowBlur = 0;
+                    if (isCriticalWindow && Math.random() < 0.25) playSynthSound(950, 'sine', 0.08, 0.06);
+                }
+            });
+            ctx.restore();
+
+            for (let i = 0; i < player.maxLives; i++) {
+                ctx.save(); ctx.translate(35 + i * 40, 40);
+                ctx.fillStyle = i < player.lives ? '#f43f5e' : '#334155'; 
+                ctx.shadowColor = i < player.lives ? '#f43f5e' : 'transparent'; ctx.shadowBlur = i < player.lives ? 10 : 0;
+                ctx.beginPath(); ctx.moveTo(0, -6); ctx.bezierCurveTo(-6, -12, -15, -6, -15, 3); ctx.bezierCurveTo(-15, 12, -4, 18, 0, 26); ctx.bezierCurveTo(4, 18, 15, 12, 15, 3); ctx.bezierCurveTo(15, -6, 6, -12, 0, -6); ctx.closePath(); ctx.fill(); ctx.restore();
+            }
+
+            const distancePercent = Math.min(1, player.x / STAGE_END_X[currentStage]);
+            ctx.fillStyle = '#1e293b'; ctx.fillRect(300, 30, 300, 10);
+            ctx.fillStyle = currentStage === 1 ? '#10b981' : currentStage === 2 ? '#3b82f6' : '#f59e0b'; ctx.fillRect(300, 30, 300 * distancePercent, 10);
+            ctx.fillStyle = '#f8fafc'; ctx.font = 'bold 13px Noto Sans KR'; ctx.textAlign = 'right'; ctx.fillText(`Stage 0${currentStage}`, 285, 40);
+            ctx.textAlign = 'left'; ctx.fillText(`${Math.floor(player.x / 100)}m / ${Math.floor(STAGE_END_X[currentStage] / 100)}m`, 615, 40);
+        }
+
+        function loop() { update(); draw(); requestAnimationFrame(loop); }
+        loop();
+    </script>
+</body>
+</html>
